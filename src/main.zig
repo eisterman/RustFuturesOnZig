@@ -13,6 +13,8 @@ const Future = struct {
     ptr: *anyopaque,
     pollfn: *const fn (ctx: *anyopaque, waker: Waker) Poll,
 
+    // Poll is called 1 time to start the future and then
+    // it will be polled again only when Waker is called
     fn poll(self: *const Future, waker: Waker) Poll {
         return self.pollfn(self.ptr, waker);
     }
@@ -46,22 +48,23 @@ const Executor = struct {
     const FutureFifo = fifo.LinearFifo(Future, fifo.LinearFifoBufferType{ .Static = 32 });
 
     taskqueue: FutureFifo,
-    wakedqueue: FutureFifo,
+    pending: u64,
 
     fn init() Executor {
         return Executor{
             .taskqueue = FutureFifo.init(),
-            .wakedqueue = FutureFifo.init(),
+            .pending = 0,
         };
     }
 
     fn spawn(self: *Executor, future: Future) !void {
         try self.taskqueue.writeItem(future);
+        self.pending += 1;
     }
 
     fn wakefuture(ctx: *anyopaque, future: Future) void {
         var self: *Executor = @ptrCast(@alignCast(ctx));
-        self.wakedqueue.writeItem(future) catch unreachable;
+        self.taskqueue.writeItem(future) catch unreachable;
     }
 
     fn pollFuture(self: *Executor, future: Future) Poll {
@@ -76,29 +79,19 @@ const Executor = struct {
 
     fn run(self: *Executor) !void {
         while (true) {
-            const futopt: ?Future = futopt: {
-                const priot = self.wakedqueue.readItem();
-                if (priot) |_| {
-                    break :futopt priot;
-                }
-                const norm = self.taskqueue.readItem();
-                break :futopt norm;
-            };
+            const futopt = self.taskqueue.readItem();
             if (futopt) |fut| {
                 switch (self.pollFuture(fut)) {
                     Poll.ready => |val| {
-                        // TODO how to remove task from taskqueue when
-                        //   the Ready has come from a Wake->Prioqueue poll?
-                        //   We dont! We replace Future queue with Task queue!
                         // Do something with the result?
                         std.debug.print("Ready: {d}\n", .{val});
+                        self.pending -= 1;
+                        if (self.pending == 0) {
+                            return;
+                        }
                     },
-                    Poll.pending => {
-                        try self.taskqueue.writeItem(fut);
-                    },
+                    Poll.pending => {},
                 }
-            } else {
-                return; // Stop when no task queued
             }
         }
     }
