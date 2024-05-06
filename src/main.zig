@@ -2,6 +2,8 @@ const std = @import("std");
 const fifo = std.fifo;
 const Allocator = std.mem.Allocator;
 
+// TODO generalize for Future return types!
+//      Very complex stuff!
 const Poll = union(enum) {
     pending: void,
     ready: u64,
@@ -19,86 +21,123 @@ const Future = struct {
     }
 };
 
-// TODO Split Waker into Waker (Interface) and our Executor Waker
-//     similarly to Future
+// Waker Interface
 const Waker = struct {
-    executorptr: *anyopaque,
-    execwakefn: *const fn (ctx: *anyopaque, task: Task) void,
-    task: Task,
+    ptr: *anyopaque,
+    wakefn: *const fn (ctx: *anyopaque) void,
 
     fn wake(self: *const Waker) void {
-        self.execwakefn(self.executorptr, self.task);
+        self.wakefn(self.ptr);
     }
 };
+
+// Here a Executor implementation for this interface
 
 const JoinHandle = struct {
     result: ?u64 = null,
 };
 
 const Task = struct {
+    id: usize,
     future: Future,
     joinhandle: ?*JoinHandle,
+    executor: *Executor,
+
+    fn getWaker(self: *Task) Waker {
+        return Waker{
+            .wakefn = Task.wake,
+            .ptr = @constCast(self),
+        };
+    }
+
+    fn poll(self: *Task) Poll {
+        return self.future.poll(self.getWaker());
+    }
+
+    fn wake(ctx: *anyopaque) void {
+        const self: *Task = @ptrCast(@alignCast(ctx));
+        self.executor.wakeTask(self.id);
+    }
+};
+
+const ExecutorError = error{
+    OutOfTaskMemory,
+    UnknownTaskID,
 };
 
 const Executor = struct {
-    const FutureFifo = fifo.LinearFifo(Task, fifo.LinearFifoBufferType{ .Static = 32 });
+    const FutureFifo = fifo.LinearFifo(usize, fifo.LinearFifoBufferType{ .Static = 32 });
 
     taskqueue: FutureFifo,
+    taskmemory: [32]?Task,
     pending: u64,
 
     fn init() Executor {
         return Executor{
             .taskqueue = FutureFifo.init(),
+            .taskmemory = [_]?Task{null} ** 32,
             .pending = 0,
         };
     }
 
     fn spawn(self: *Executor, future: Future, joinhandle: ?*JoinHandle) !void {
-        const task = Task{
-            .future = future,
-            .joinhandle = joinhandle,
-        };
-        try self.taskqueue.writeItem(task);
-        self.pending += 1;
+        var taskid: ?usize = null;
+        for (&self.taskmemory, 0..) |*taskopt, i| {
+            if (taskopt.* == null) {
+                taskopt.* = Task{
+                    .id = i,
+                    .future = future,
+                    .joinhandle = joinhandle,
+                    .executor = self,
+                };
+                taskid = i;
+                break;
+            }
+        }
+        if (taskid) |id| {
+            try self.taskqueue.writeItem(id);
+            self.pending += 1;
+        } else {
+            return ExecutorError.OutOfTaskMemory;
+        }
     }
 
-    fn wakeTask(ctx: *anyopaque, task: Task) void {
-        var self: *Executor = @ptrCast(@alignCast(ctx));
-        self.taskqueue.writeItem(task) catch unreachable;
-    }
-
-    fn pollTask(self: *Executor, task: Task) Poll {
-        const waker = Waker{
-            .executorptr = self,
-            .execwakefn = Executor.wakeTask,
-            .task = task,
-        };
-        const poll = task.future.poll(waker);
-        return poll;
+    fn wakeTask(self: *Executor, taskid: usize) void {
+        self.taskqueue.writeItem(taskid) catch unreachable;
     }
 
     fn run(self: *Executor) !void {
         while (true) {
-            const taskopt = self.taskqueue.readItem();
-            if (taskopt) |task| {
-                switch (self.pollTask(task)) {
-                    Poll.ready => |val| {
-                        // Do something with the result
-                        std.debug.print("Ready: {d}\n", .{val});
-                        if (task.joinhandle) |jh| {
-                            jh.result = val;
-                        }
-                        self.pending -= 1;
-                        if (self.pending == 0) {
-                            return;
-                        }
-                    },
-                    Poll.pending => {},
+            const taskidopt = self.taskqueue.readItem();
+            if (taskidopt) |taskid| {
+                const taskptr = &self.taskmemory[taskid];
+                // In general Capture syntax is possibly a Copy so they are to NOT use when the address of self is important!
+                // It's better to spam .*.? because in Release the .? become nop and we don't risk dangling ptrs.
+                if (taskptr.* != null) {
+                    switch (taskptr.*.?.poll()) {
+                        Poll.ready => |val| {
+                            const taskval = taskptr.*.?; // From here the ptr is not important
+                            std.debug.print("Ready Task {d}: {d}\n", .{ taskval.id, val });
+                            if (taskval.joinhandle) |jh| {
+                                jh.result = val;
+                            }
+                            taskptr.* = null;
+                            self.pending -= 1;
+                            if (self.pending == 0) {
+                                return;
+                            }
+                        },
+                        Poll.pending => {},
+                    }
+                } else {
+                    return ExecutorError.UnknownTaskID;
                 }
             }
         }
     }
 };
+
+// Here a test Future to try the Executor
 
 fn asyncthings(waker: Waker, res: *?u64, resmutex: *std.Thread.Mutex, timesec: u64, out: u64) void {
     std.time.sleep(timesec * 1000000000); // Seconds
@@ -153,7 +192,7 @@ const WaitFuture = struct {
 pub fn main() !void {
     // The original implementor of Future NEED TO BE PINNED IN MEMORY
     // They need to be still in memory without move for all the length of the Executor Run
-    // The same for JoinHandlers if needed
+    // The same for JoinHandlers and Executor
     var jh1 = JoinHandle{};
     var jh3 = JoinHandle{};
     var fut1 = WaitFuture{ .out = 42, .seconds = 3 };
