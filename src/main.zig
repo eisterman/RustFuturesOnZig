@@ -2,7 +2,6 @@ const std = @import("std");
 const fifo = std.fifo;
 const Allocator = std.mem.Allocator;
 
-// TODO Implement a Return Handler for the futures, to read the results
 const Poll = union(enum) {
     pending: void,
     ready: u64,
@@ -24,28 +23,25 @@ const Future = struct {
 //     similarly to Future
 const Waker = struct {
     executorptr: *anyopaque,
-    execwakefn: *const fn (ctx: *anyopaque, future: Future) void,
-    future: Future,
+    execwakefn: *const fn (ctx: *anyopaque, task: Task) void,
+    task: Task,
 
     fn wake(self: *const Waker) void {
-        self.execwakefn(self.executorptr, self.future);
+        self.execwakefn(self.executorptr, self.task);
     }
 };
 
 const JoinHandle = struct {
-    //TODO Devo trovare un modo di tornare l'output di una task allo schedulatore originale
-    //di essa. L'ideale e' un JoinHandle con una variabile (non serve il Mutex perche siamo
-    //in single-thread) che l'Executor vada a scrivere. Il JoinHandle e' anche lui Pin.
-    //La vera domanda e' come collegare il Future al Handle dato che al momento manca la
-    //struttura delle Task all'interno del Executor ma uso i Future direttamente.
-    //L'unico modo sarebbe creare un oggetto Task che contenga Future e *JoinHandle.
-    //Il waker deve poter quindi ricreare l'intero oggetto.
-    //Ovvero basta togliere Waker.future e sostituirlo con Waker.task!
-    //Dovrebbe essere tutto abbastanza straightforward.
+    result: ?u64 = null,
+};
+
+const Task = struct {
+    future: Future,
+    joinhandle: ?*JoinHandle,
 };
 
 const Executor = struct {
-    const FutureFifo = fifo.LinearFifo(Future, fifo.LinearFifoBufferType{ .Static = 32 });
+    const FutureFifo = fifo.LinearFifo(Task, fifo.LinearFifoBufferType{ .Static = 32 });
 
     taskqueue: FutureFifo,
     pending: u64,
@@ -57,34 +53,41 @@ const Executor = struct {
         };
     }
 
-    fn spawn(self: *Executor, future: Future) !void {
-        try self.taskqueue.writeItem(future);
+    fn spawn(self: *Executor, future: Future, joinhandle: ?*JoinHandle) !void {
+        const task = Task{
+            .future = future,
+            .joinhandle = joinhandle,
+        };
+        try self.taskqueue.writeItem(task);
         self.pending += 1;
     }
 
-    fn wakefuture(ctx: *anyopaque, future: Future) void {
+    fn wakeTask(ctx: *anyopaque, task: Task) void {
         var self: *Executor = @ptrCast(@alignCast(ctx));
-        self.taskqueue.writeItem(future) catch unreachable;
+        self.taskqueue.writeItem(task) catch unreachable;
     }
 
-    fn pollFuture(self: *Executor, future: Future) Poll {
+    fn pollTask(self: *Executor, task: Task) Poll {
         const waker = Waker{
             .executorptr = self,
-            .execwakefn = Executor.wakefuture,
-            .future = future,
+            .execwakefn = Executor.wakeTask,
+            .task = task,
         };
-        const poll = future.poll(waker);
+        const poll = task.future.poll(waker);
         return poll;
     }
 
     fn run(self: *Executor) !void {
         while (true) {
-            const futopt = self.taskqueue.readItem();
-            if (futopt) |fut| {
-                switch (self.pollFuture(fut)) {
+            const taskopt = self.taskqueue.readItem();
+            if (taskopt) |task| {
+                switch (self.pollTask(task)) {
                     Poll.ready => |val| {
-                        // Do something with the result?
+                        // Do something with the result
                         std.debug.print("Ready: {d}\n", .{val});
+                        if (task.joinhandle) |jh| {
+                            jh.result = val;
+                        }
                         self.pending -= 1;
                         if (self.pending == 0) {
                             return;
@@ -150,13 +153,18 @@ const WaitFuture = struct {
 pub fn main() !void {
     // The original implementor of Future NEED TO BE PINNED IN MEMORY
     // They need to be still in memory without move for all the length of the Executor Run
+    // The same for JoinHandlers if needed
+    var jh1 = JoinHandle{};
+    var jh3 = JoinHandle{};
     var fut1 = WaitFuture{ .out = 42, .seconds = 3 };
     var fut2 = WaitFuture{ .out = 16, .seconds = 1 };
     var fut3 = WaitFuture{ .out = 24, .seconds = 2 };
     var executor = Executor.init();
-    try executor.spawn(fut1.future());
-    try executor.spawn(fut2.future());
-    try executor.spawn(fut3.future());
+    try executor.spawn(fut1.future(), &jh1);
+    try executor.spawn(fut2.future(), null);
+    try executor.spawn(fut3.future(), &jh3);
     try executor.run();
-    std.debug.print("Execution completed\n", .{});
+    std.debug.print("Execution completed. Results:\n", .{});
+    std.debug.print("Fut1 JoinHandle.result = {d}\n", .{jh1.result.?});
+    std.debug.print("Fut3 JoinHandle.result = {d}\n", .{jh3.result.?});
 }
