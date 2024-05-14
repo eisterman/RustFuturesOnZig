@@ -1,25 +1,26 @@
 const std = @import("std");
 const fifo = std.fifo;
 const Allocator = std.mem.Allocator;
+const FixedBufferAllocator = std.heap.FixedBufferAllocator;
 
-// TODO generalize for Future return types!
-//      Very complex stuff!
-const Poll = union(enum) {
-    pending: void,
-    ready: u64,
-};
+fn GPoll(comptime T: type) type {
+    return union(enum) {
+        pending: void,
+        ready: T,
+    };
+}
 
-// Future Interface
-const Future = struct {
-    ptr: *anyopaque,
-    pollfn: *const fn (ctx: *anyopaque, waker: Waker) Poll,
+fn GFuture(comptime T: type) type {
+    return struct {
+        ptr: *anyopaque,
+        pollfn: *const fn (ctx: *anyopaque, waker: Waker) GPoll(T),
+        const Self = @This();
 
-    // Poll is called 1 time to start the future and then
-    // it will be polled again only when Waker is called
-    fn poll(self: *const Future, waker: Waker) Poll {
-        return self.pollfn(self.ptr, waker);
-    }
-};
+        fn poll(self: *const Self, waker: Waker) GPoll(T) {
+            return self.pollfn(self.ptr, waker);
+        }
+    };
+}
 
 // Waker Interface
 const Waker = struct {
@@ -33,63 +34,117 @@ const Waker = struct {
 
 // Here a Executor implementation for this interface
 
-const JoinHandle = struct {
-    result: ?u64 = null,
+fn GJoinHandle(comptime T: type) type {
+    return struct {
+        result: ?T = null,
+    };
+}
+
+const TaskVTable = struct {
+    pollReady: *const fn (ctx: *anyopaque) bool,
+    getId: *const fn (ctx: *anyopaque) usize,
 };
 
-const Task = struct {
-    id: usize,
-    future: Future,
-    joinhandle: ?*JoinHandle,
-    executor: *Executor,
+const TaskInterface = struct {
+    ptr: *anyopaque,
+    tasksize: usize,
+    vtable: TaskVTable,
 
-    fn getWaker(self: *Task) Waker {
-        return Waker{
-            .wakefn = Task.wake,
-            .ptr = @constCast(self),
-        };
+    const Self = @This();
+
+    fn pollReady(self: Self) bool {
+        return self.vtable.pollReady(self.ptr);
     }
 
-    fn poll(self: *Task) Poll {
-        return self.future.poll(self.getWaker());
-    }
-
-    fn wake(ctx: *anyopaque) void {
-        const self: *Task = @ptrCast(@alignCast(ctx));
-        self.executor.wakeTask(self.id);
+    fn getId(self: Self) usize {
+        return self.vtable.getId(self.ptr);
     }
 };
 
-const ExecutorError = error{
-    OutOfTaskMemory,
-    UnknownTaskID,
-};
+fn GTask(comptime T: type) type {
+    return struct {
+        id: usize,
+        future: GFuture(T),
+        joinhandle: ?*GJoinHandle(T),
+        executor: *GExecutor,
 
-const Executor = struct {
+        const Self = @This();
+
+        fn getWaker(self: *Self) Waker {
+            return Waker{
+                .wakefn = Self.wake,
+                .ptr = self,
+            };
+        }
+
+        fn pollReady(ctx: *anyopaque) bool {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            switch (self.future.poll(self.getWaker())) {
+                GPoll(T).pending => return false,
+                GPoll(T).ready => |val| {
+                    std.debug.print("Ready Task {d}: {d}\n", .{ self.id, val });
+                    if (self.joinhandle) |jh| {
+                        jh.result = val;
+                    }
+                    return true;
+                },
+            }
+        }
+
+        fn getId(ctx: *anyopaque) usize {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            return self.id;
+        }
+
+        fn wake(ctx: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.executor.wakeTask(self.id);
+        }
+
+        fn task(self: *Self) TaskInterface {
+            return TaskInterface{
+                .ptr = self,
+                .tasksize = @sizeOf(Self),
+                .vtable = TaskVTable{
+                    .getId = Self.getId,
+                    .pollReady = Self.pollReady,
+                },
+            };
+        }
+    };
+}
+
+const GExecutor = struct {
     const FutureFifo = fifo.LinearFifo(usize, fifo.LinearFifoBufferType{ .Static = 32 });
 
     taskqueue: FutureFifo,
-    taskmemory: [32]?Task,
+    taskmemory: [32]?TaskInterface,
     pending: u64,
+    allocator: Allocator,
 
-    fn init() Executor {
-        return Executor{
+    const Self = @This();
+
+    fn init(allocator: Allocator) Self {
+        return Self{
             .taskqueue = FutureFifo.init(),
-            .taskmemory = [_]?Task{null} ** 32,
+            .taskmemory = [_]?TaskInterface{null} ** 32,
             .pending = 0,
+            .allocator = allocator,
         };
     }
 
-    fn spawn(self: *Executor, future: Future, joinhandle: ?*JoinHandle) !void {
+    fn spawn(self: *Self, comptime T: type, future: GFuture(T), joinhandle: ?*GJoinHandle(T)) !void {
         var taskid: ?usize = null;
         for (&self.taskmemory, 0..) |*taskopt, i| {
             if (taskopt.* == null) {
-                taskopt.* = Task{
+                const newtaskptr = try self.allocator.create(GTask(T));
+                newtaskptr.* = GTask(T){
                     .id = i,
                     .future = future,
                     .joinhandle = joinhandle,
                     .executor = self,
                 };
+                taskopt.* = newtaskptr.task();
                 taskid = i;
                 break;
             }
@@ -102,32 +157,24 @@ const Executor = struct {
         }
     }
 
-    fn wakeTask(self: *Executor, taskid: usize) void {
+    fn wakeTask(self: *Self, taskid: usize) void {
         self.taskqueue.writeItem(taskid) catch unreachable;
     }
 
-    fn run(self: *Executor) !void {
+    fn run(self: *Self) !void {
         while (true) {
             const taskidopt = self.taskqueue.readItem();
             if (taskidopt) |taskid| {
-                const taskptr = &self.taskmemory[taskid];
-                // In general Capture syntax is possibly a Copy so they are to NOT use when the address of self is important!
-                // It's better to spam .*.? because in Release the .? become nop and we don't risk dangling ptrs.
-                if (taskptr.* != null) {
-                    switch (taskptr.*.?.poll()) {
-                        Poll.ready => |val| {
-                            const taskval = taskptr.*.?; // From here the ptr is not important
-                            std.debug.print("Ready Task {d}: {d}\n", .{ taskval.id, val });
-                            if (taskval.joinhandle) |jh| {
-                                jh.result = val;
-                            }
-                            taskptr.* = null;
-                            self.pending -= 1;
-                            if (self.pending == 0) {
-                                return;
-                            }
-                        },
-                        Poll.pending => {},
+                const taskopt = self.taskmemory[taskid];
+                if (taskopt) |task| {
+                    if (task.pollReady()) {
+                        // Ready
+                        self.taskmemory[taskid] = null;
+                        // I need the ptr to be aligned and sized properly compiletime for the free to work!
+                        const slicetofree: []u8 = @as([*]u8, @ptrCast(@alignCast(task.ptr)))[0..task.tasksize];
+                        self.allocator.free(slicetofree);
+                        self.pending -= 1;
+                        if (self.pending == 0) return;
                     }
                 } else {
                     return ExecutorError.UnknownTaskID;
@@ -137,71 +184,82 @@ const Executor = struct {
     }
 };
 
-// Here a test Future to try the Executor
-
-fn asyncthings(waker: Waker, res: *?u64, resmutex: *std.Thread.Mutex, timesec: u64, out: u64) void {
-    std.time.sleep(timesec * 1000000000); // Seconds
-    {
-        resmutex.lock();
-        defer resmutex.unlock();
-        res.* = out;
-    }
-    waker.wake();
-}
-
-const WaitFuture = struct {
-    out: u64,
-    seconds: u64,
-    launched: bool = false,
-    resultmutex: std.Thread.Mutex = std.Thread.Mutex{},
-    result: ?u64 = null,
-
-    fn poll(ctx: *anyopaque, waker: Waker) Poll {
-        var self: *WaitFuture = @ptrCast(@alignCast(ctx));
-        if (!self.launched) {
-            var thread = std.Thread.spawn(.{}, asyncthings, .{
-                waker,
-                &self.result,
-                &self.resultmutex,
-                self.seconds,
-                self.out,
-            }) catch unreachable;
-            thread.detach();
-            self.launched = true;
-            return Poll{ .pending = {} };
-        }
-        {
-            self.resultmutex.lock();
-            defer self.resultmutex.unlock();
-            if (self.result) |r| {
-                return Poll{ .ready = r };
-            } else {
-                return Poll{ .pending = {} };
-            }
-        }
-    }
-
-    fn future(self: *WaitFuture) Future {
-        return Future{
-            .ptr = self,
-            .pollfn = WaitFuture.poll,
-        };
-    }
+const ExecutorError = error{
+    OutOfTaskMemory,
+    UnknownTaskID,
 };
 
+// Here a test Future to try the Executor
+fn GWaitFuture(comptime T: type) type {
+    return struct {
+        out: T,
+        seconds: u64,
+        launched: bool = false,
+        resultmutex: std.Thread.Mutex = std.Thread.Mutex{},
+        result: ?T = null,
+
+        const Self = @This();
+
+        fn asyncthings(waker: Waker, res: *?T, resmutex: *std.Thread.Mutex, timesec: u64, out: T) void {
+            std.time.sleep(timesec * 1000000000); // Seconds
+            {
+                resmutex.lock();
+                defer resmutex.unlock();
+                res.* = out;
+            }
+            waker.wake();
+        }
+
+        fn poll(ctx: *anyopaque, waker: Waker) GPoll(T) {
+            var self: *Self = @ptrCast(@alignCast(ctx));
+            if (!self.launched) {
+                var thread = std.Thread.spawn(.{}, Self.asyncthings, .{
+                    waker,
+                    &self.result,
+                    &self.resultmutex,
+                    self.seconds,
+                    self.out,
+                }) catch unreachable;
+                thread.detach();
+                self.launched = true;
+                return GPoll(T){ .pending = {} };
+            }
+            {
+                self.resultmutex.lock();
+                defer self.resultmutex.unlock();
+                if (self.result) |r| {
+                    return GPoll(T){ .ready = r };
+                } else {
+                    std.debug.print("Poll when not ready!\n", .{});
+                    return GPoll(T){ .pending = {} };
+                }
+            }
+        }
+
+        fn future(self: *Self) GFuture(T) {
+            return GFuture(T){
+                .ptr = self,
+                .pollfn = Self.poll,
+            };
+        }
+    };
+}
+
 pub fn main() !void {
+    var taskbuffer = [_]u8{0} ** 1024;
+    var fba = FixedBufferAllocator.init(&taskbuffer);
     // The original implementor of Future NEED TO BE PINNED IN MEMORY
     // They need to be still in memory without move for all the length of the Executor Run
     // The same for JoinHandlers and Executor
-    var jh1 = JoinHandle{};
-    var jh3 = JoinHandle{};
-    var fut1 = WaitFuture{ .out = 42, .seconds = 3 };
-    var fut2 = WaitFuture{ .out = 16, .seconds = 1 };
-    var fut3 = WaitFuture{ .out = 24, .seconds = 2 };
-    var executor = Executor.init();
-    try executor.spawn(fut1.future(), &jh1);
-    try executor.spawn(fut2.future(), null);
-    try executor.spawn(fut3.future(), &jh3);
+    var jh1 = GJoinHandle(u16){};
+    var jh3 = GJoinHandle(u64){};
+    var fut1 = GWaitFuture(u16){ .out = 42, .seconds = 3 };
+    var fut2 = GWaitFuture(u32){ .out = 16, .seconds = 1 };
+    var fut3 = GWaitFuture(u64){ .out = 24, .seconds = 2 };
+    var executor = GExecutor.init(fba.allocator());
+    try executor.spawn(u16, fut1.future(), &jh1);
+    try executor.spawn(u32, fut2.future(), null);
+    try executor.spawn(u64, fut3.future(), &jh3);
     try executor.run();
     std.debug.print("Execution completed. Results:\n", .{});
     std.debug.print("Fut1 JoinHandle.result = {d}\n", .{jh1.result.?});
