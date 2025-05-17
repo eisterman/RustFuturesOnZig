@@ -15,15 +15,16 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
-    const rfutures = b.addModule("rfutures", .{ .root_source_file = .{ .path = "src/main.zig" } });
+    const rfutures = b.addModule("rfutures", .{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize });
 
-    const exe = b.addExecutable(.{
-        .name = "WaitFutureExample",
+    const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/examples/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    exe.root_module.addImport("rfutures", rfutures);
+    exe_mod.addImport("rfutures", rfutures);
+
+    const exe = b.addExecutable(.{ .name = "WaitFutureExample", .root_module = exe_mod });
 
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
