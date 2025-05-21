@@ -17,37 +17,40 @@ pub fn build(b: *std.Build) void {
 
     const rfutures = b.addModule("rfutures", .{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize });
 
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/examples/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    exe_mod.addImport("rfutures", rfutures);
 
-    const exe = b.addExecutable(.{ .name = "WaitFutureExample", .root_module = exe_mod });
+    // Path to the directory you want to iterate over
+    const dir_path = "src/examples";
 
-    // This *creates* a Run step in the build graph, to be executed when another
-    // step is evaluated that depends on it. The next line below will establish
-    // such a dependency.
-    const run_cmd = b.addRunArtifact(exe);
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch unreachable;
+    defer dir.close();
 
-    // By making the run step depend on the install step, it will be run from the
-    // installation directory rather than directly from within the cache directory.
-    // This is not necessary, however, if the application depends on other installed
-    // files, this ensures they will be present and in the expected location.
-    run_cmd.step.dependOn(b.getInstallStep());
+    var it = dir.iterate();
 
-    // This allows the user to pass arguments to the application in the build
-    // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
+    while (it.next() catch unreachable) |entry| {
+        if (entry.kind != .file) continue;
+
+        const filename = entry.name;
+
+        const exe = b.addExecutable(.{ 
+            .name = b.fmt("Example {s}", .{filename}), 
+            .root_source_file = b.path(b.fmt("src/examples/{s}", .{filename})),
+            .target = target,
+            .optimize = optimize,
+        });
+        exe.root_module.addImport("rfutures", rfutures);
+
+        const run_cmd = b.addRunArtifact(exe);
+        if (b.args) |args| {
+            run_cmd.addArgs(args);
+        }
+
+        const run_step = b.step(b.fmt("run.{s}", .{filename}), b.fmt("Run {s} example", .{filename}));
+
+        run_step.dependOn(&run_cmd.step);
     }
-
     // This creates a build step. It will be visible in the `zig build --help` menu,
     // and can be selected like this: `zig build run`
     // This will evaluate the `run` step rather than the default, which is "install".
-    const run_step = b.step("run.waitfuture", "Run the WaitFuture example");
-    run_step.dependOn(&run_cmd.step);
 
     // const exe_unit_tests = b.addTest(.{
     //     .root_source_file = b.path("src/main.zig"),
